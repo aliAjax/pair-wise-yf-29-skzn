@@ -28,7 +28,10 @@ python3 -m unittest -v
 - `POST /api/evidence/{id}/derive`：分析员从已开箱证据创建衍生证据。
 - `POST /api/evidence/{id}/hold`：审计员或案件创建人设置/解除法律保留。
 - `POST /api/evidence/{id}/release`：存在法律保留时拒绝释放。
-- `GET /api/cases/{id}/report`：校验所有证据哈希和每条事件链，导出完整报告。
+- `POST /api/cases/{id}/release-batches`：审计员按保留期限生成释放复核单，逐条快照当时状态（状态、法律保留、保管人、哈希、保管链头），不可释放的标注原因（仍在法律保留、保留期限未届满等）；可用 `evidence_ids` 显式指定证据。
+- `GET /api/cases/{id}/release-batches`、`GET /api/release-batches/{id}`：查看复核单；崩溃重启后可找回未完成的批次。
+- `POST /api/release-batches/{id}/execute`：保管员执行或断点续执行。复核后被改动或保留状态变化的条目作废并写明原因；每条证据一个事务，已写入的条目幂等跳过，两名保管员并发执行也不会重复释放。
+- `GET /api/cases/{id}/report`：校验所有证据哈希和每条事件链，导出完整报告；报告包含复核单与实际释放结果的逐条核对（`release_reconciliation_valid`）。
 - 所有 `DELETE` 请求返回 405；证据和保管记录不提供删除接口。
 
 保管事件通过前一条事件哈希串联；报告会重新计算文件哈希和事件链。项目适合流程与完整性原型，不涵盖现实中的签名证书、WORM 存储、证据文件加密或司法辖区合规认证。

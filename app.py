@@ -90,6 +90,24 @@ class CustodyStore:
                     case_id INTEGER NOT NULL REFERENCES cases(id), actor_id TEXT NOT NULL REFERENCES users(id),
                     action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS release_batches(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL REFERENCES cases(id),
+                    recipient TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS release_batch_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES release_batches(id),
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    review_status TEXT NOT NULL CHECK(review_status IN ('pending','ineligible','released','voided')),
+                    ineligible_reason TEXT NOT NULL DEFAULT '', void_reason TEXT NOT NULL DEFAULT '',
+                    snap_status TEXT NOT NULL, snap_legal_hold INTEGER NOT NULL CHECK(snap_legal_hold IN (0,1)),
+                    snap_custodian TEXT NOT NULL, snap_sha256 TEXT NOT NULL, snap_retention TEXT NOT NULL,
+                    snap_head_hash TEXT NOT NULL, snap_head_seq INTEGER NOT NULL,
+                    processed_by TEXT, processed_at TEXT,
+                    UNIQUE(batch_id,evidence_id)
+                );
                 """
             )
 
@@ -356,6 +374,191 @@ class CustodyStore:
                 conn.rollback()
                 raise
 
+    @staticmethod
+    def _review_block_reason(row, today):
+        if row["legal_hold"]:
+            return "仍在法律保留"
+        if row["status"] == "released":
+            return "证据已释放"
+        if row["retention_until"] > today:
+            return "保留期限未届满"
+        return ""
+
+    def _chain_head(self, conn, evidence_id):
+        return conn.execute(
+            "SELECT event_hash,sequence FROM custody_events WHERE evidence_id=? ORDER BY sequence DESC LIMIT 1",
+            (evidence_id,),
+        ).fetchone()
+
+    def _batch(self, conn, batch_id):
+        row = conn.execute("SELECT * FROM release_batches WHERE id=?", (batch_id,)).fetchone()
+        if not row:
+            raise BusinessError("释放复核单不存在", 404, "not_found")
+        return row
+
+    def create_release_batch(self, user_id, case_id, recipient, evidence_ids=None, note=""):
+        recipient = recipient.strip()
+        if not recipient:
+            raise BusinessError("接收方不能为空", 422, "recipient_required")
+        if evidence_ids is not None:
+            if not isinstance(evidence_ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in evidence_ids):
+                raise BusinessError("evidence_ids 必须是证据编号数组", 422, "invalid_evidence_ids")
+            evidence_ids = list(dict.fromkeys(evidence_ids))
+        today = date.today().isoformat()
+        with self.connect() as conn:
+            case = self._case(conn, case_id)
+            if user_id != case["created_by"]:
+                self._member(conn, case_id, user_id, {"auditor"})
+            else:
+                self._user(conn, user_id)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if evidence_ids is None:
+                    rows = conn.execute(
+                        "SELECT * FROM evidence WHERE case_id=? AND retention_until<=? AND status!='released' ORDER BY id",
+                        (case_id, today),
+                    ).fetchall()
+                else:
+                    rows = [self._evidence(conn, eid) for eid in evidence_ids]
+                    for row in rows:
+                        if row["case_id"] != case_id:
+                            raise BusinessError("证据不属于该案件", 422, "evidence_case_mismatch")
+                if not rows:
+                    raise BusinessError("没有符合保留期限条件的证据可列入复核单", 422, "empty_batch")
+                cur = conn.execute(
+                    "INSERT INTO release_batches(case_id,recipient,note,created_by,created_at) VALUES(?,?,?,?,?)",
+                    (case_id, recipient, note.strip(), user_id, now()),
+                )
+                batch_id = cur.lastrowid
+                eligible = 0
+                for row in rows:
+                    reason = self._review_block_reason(row, today)
+                    eligible += 0 if reason else 1
+                    head = self._chain_head(conn, row["id"])
+                    conn.execute(
+                        """INSERT INTO release_batch_items(batch_id,evidence_id,review_status,ineligible_reason,
+                             snap_status,snap_legal_hold,snap_custodian,snap_sha256,snap_retention,snap_head_hash,snap_head_seq)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (batch_id, row["id"], "ineligible" if reason else "pending", reason,
+                         row["status"], row["legal_hold"], row["current_custodian"], row["sha256"],
+                         row["retention_until"], head["event_hash"], head["sequence"]),
+                    )
+                self._audit(conn, case_id, user_id, "release_batch.create",
+                            {"batch_id": batch_id, "recipient": recipient, "items": len(rows), "eligible": eligible})
+            except Exception:
+                conn.rollback()
+                raise
+        return self.get_release_batch(user_id, batch_id)
+
+    def _batch_view(self, conn, batch, include_items=True):
+        counts = {"pending": 0, "ineligible": 0, "released": 0, "voided": 0}
+        items = []
+        rows = conn.execute(
+            """SELECT i.*, e.label, e.status AS current_status, e.legal_hold AS current_legal_hold,
+                      e.current_custodian AS current_custodian
+               FROM release_batch_items i JOIN evidence e ON e.id=i.evidence_id
+               WHERE i.batch_id=? ORDER BY i.id""",
+            (batch["id"],),
+        ).fetchall()
+        for r in rows:
+            counts[r["review_status"]] += 1
+            if include_items:
+                items.append({
+                    "id": r["id"], "evidence_id": r["evidence_id"], "label": r["label"],
+                    "review_status": r["review_status"],
+                    "ineligible_reason": r["ineligible_reason"], "void_reason": r["void_reason"],
+                    "snapshot": {
+                        "status": r["snap_status"], "legal_hold": bool(r["snap_legal_hold"]),
+                        "current_custodian": r["snap_custodian"], "sha256": r["snap_sha256"],
+                        "retention_until": r["snap_retention"],
+                        "chain_head_hash": r["snap_head_hash"], "chain_head_sequence": r["snap_head_seq"],
+                    },
+                    "current": {
+                        "status": r["current_status"], "legal_hold": bool(r["current_legal_hold"]),
+                        "current_custodian": r["current_custodian"],
+                    },
+                    "processed_by": r["processed_by"], "processed_at": r["processed_at"],
+                })
+        view = {
+            "id": batch["id"], "case_id": batch["case_id"], "recipient": batch["recipient"],
+            "note": batch["note"], "created_by": batch["created_by"], "created_at": batch["created_at"],
+            "status": "open" if counts["pending"] else "completed", "counts": counts,
+        }
+        if include_items:
+            view["items"] = items
+        return view
+
+    def get_release_batch(self, user_id, batch_id):
+        with self.connect() as conn:
+            batch = self._batch(conn, batch_id)
+            self._member(conn, batch["case_id"], user_id)
+            return self._batch_view(conn, batch)
+
+    def list_release_batches(self, user_id, case_id):
+        with self.connect() as conn:
+            self._member(conn, case_id, user_id)
+            return {"batches": [self._batch_view(conn, b, include_items=False) for b in conn.execute(
+                "SELECT * FROM release_batches WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]}
+
+    def execute_release_batch(self, user_id, batch_id):
+        summary = {"batch_id": batch_id, "released": [], "voided": [], "skipped": []}
+        with self.connect() as conn:
+            batch = self._batch(conn, batch_id)
+            self._member(conn, batch["case_id"], user_id, {"custodian"})
+            case_id, recipient = batch["case_id"], batch["recipient"]
+            pending = [r["id"] for r in conn.execute(
+                "SELECT id FROM release_batch_items WHERE batch_id=? AND review_status='pending' ORDER BY id",
+                (batch_id,)).fetchall()]
+        # 每条证据一个事务：崩溃时未完成的条目回滚为 pending，重启后可续执行且不重复
+        for item_id in pending:
+            with self.connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    item = conn.execute("SELECT * FROM release_batch_items WHERE id=?", (item_id,)).fetchone()
+                    if item["review_status"] != "pending":
+                        summary["skipped"].append(item["evidence_id"])
+                        continue
+                    ev = self._evidence(conn, item["evidence_id"])
+                    head = self._chain_head(conn, ev["id"])
+                    changes = []
+                    if ev["status"] != item["snap_status"]:
+                        changes.append(f"状态由 {item['snap_status']} 变为 {ev['status']}")
+                    if ev["legal_hold"] != item["snap_legal_hold"]:
+                        changes.append("法律保留状态已变更")
+                    if ev["current_custodian"] != item["snap_custodian"]:
+                        changes.append(f"保管人由 {item['snap_custodian']} 变为 {ev['current_custodian']}")
+                    if ev["sha256"] != item["snap_sha256"]:
+                        changes.append("内容哈希已变更")
+                    if ev["retention_until"] != item["snap_retention"]:
+                        changes.append("保留期限已变更")
+                    if head["event_hash"] != item["snap_head_hash"] or head["sequence"] != item["snap_head_seq"]:
+                        changes.append("保管链在复核后新增了事件")
+                    if changes:
+                        reason = "复核后证据被改动，条目作废：" + "；".join(changes)
+                        conn.execute(
+                            "UPDATE release_batch_items SET review_status='voided',void_reason=?,processed_by=?,processed_at=? WHERE id=?",
+                            (reason, user_id, now(), item_id))
+                        self._audit(conn, case_id, user_id, "release_batch.void",
+                                    {"batch_id": batch_id, "evidence_id": item["evidence_id"], "reason": reason})
+                        summary["voided"].append({"evidence_id": item["evidence_id"], "reason": reason})
+                    else:
+                        self._append_event(conn, ev["id"], "RELEASE", user_id,
+                                           from_person=ev["current_custodian"], to_person=recipient,
+                                           note=f"释放复核单 #{batch_id} 批量释放")
+                        conn.execute("UPDATE evidence SET status='released' WHERE id=?", (ev["id"],))
+                        conn.execute(
+                            "UPDATE release_batch_items SET review_status='released',processed_by=?,processed_at=? WHERE id=?",
+                            (user_id, now(), item_id))
+                        self._audit(conn, case_id, user_id, "evidence.release",
+                                    {"evidence_id": ev["id"], "recipient": recipient, "batch_id": batch_id})
+                        summary["released"].append(item["evidence_id"])
+                except Exception:
+                    conn.rollback()
+                    raise
+        with self.connect() as conn:
+            summary["status"] = self._batch_view(conn, self._batch(conn, batch_id), include_items=False)["status"]
+        return summary
+
     def report(self, user_id, case_id):
         with self.connect() as conn:
             self._member(conn, case_id, user_id)
@@ -384,10 +587,28 @@ class CustodyStore:
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
                 })
             audit = conn.execute("SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+            release_batches, release_ok = [], True
+            for b in conn.execute("SELECT * FROM release_batches WHERE case_id=? ORDER BY id", (case_id,)).fetchall():
+                view = self._batch_view(conn, b)
+                marker = f"释放复核单 #{b['id']} "
+                reconciled = True
+                for item in view["items"]:
+                    batch_releases = conn.execute(
+                        "SELECT COUNT(*) AS c FROM custody_events WHERE evidence_id=? AND event_type='RELEASE' AND note LIKE ?",
+                        (item["evidence_id"], marker + "%")).fetchone()["c"]
+                    if item["review_status"] == "released":
+                        item["matches_actual"] = item["current"]["status"] == "released" and batch_releases == 1
+                    else:
+                        item["matches_actual"] = batch_releases == 0
+                    reconciled = reconciled and item["matches_actual"]
+                view["reconciled"] = reconciled
+                release_ok = release_ok and reconciled
+                release_batches.append(view)
             return {
                 "case": dict(case), "generated_at": now(), "overall_integrity_valid": all_valid,
                 "evidence_count": len(items), "evidence": items,
                 "audit": [dict(a) | {"detail": json.loads(a["detail"])} for a in audit],
+                "release_batches": release_batches, "release_reconciliation_valid": release_ok,
             }
 
 
@@ -420,6 +641,15 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201,store.ingest_evidence(user,int(parts[2]),d.get("label",""),d.get("filename",""),d.get("content_b64",""),d.get("retention_until",""),d.get("custodian")))
         if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="report" and method=="GET":
             return self._send(200,store.report(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="release-batches":
+            if method=="POST":
+                d=self._body(); return self._send(201,store.create_release_batch(user,int(parts[2]),d.get("recipient",""),d.get("evidence_ids"),d.get("note","")))
+            if method=="GET":
+                return self._send(200,store.list_release_batches(user,int(parts[2])))
+        if len(parts)>=3 and parts[:2]==["api","release-batches"]:
+            batch_id=int(parts[2])
+            if len(parts)==3 and method=="GET": return self._send(200,store.get_release_batch(user,batch_id))
+            if len(parts)==4 and parts[3]=="execute" and method=="POST": return self._send(200,store.execute_release_batch(user,batch_id))
         if len(parts)>=3 and parts[:2]==["api","evidence"]:
             evidence_id=int(parts[2])
             if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
